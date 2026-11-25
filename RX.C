@@ -1,397 +1,479 @@
 
-/*
-  CAN MONITOR V4 - UNO #2 RECEIVER
-
-  OLED : SDA A4, SCL A5
-  CAN  : CS D10, SI D11, SO D12,
-         SCK D13, INT D2
-
-  0x100 : 조작값 수신
-  0x101 : 검증 응답 송신
-
-  LED 없음 / 화면 점멸 없음
-*/
-
 #include <SPI.h>
 #include <Wire.h>
 #include <mcp2515.h>
 #include <U8g2lib.h>
 
-// ===== 기본 설정 =====
-const byte CAN_CS = 10;
+// ==========================================
+// CAN THRUSTER RX - FAST / AUTO RECOVERY
+// UNO + MCP2515 + SH1107 OLED
+// HL-52S V1.0 DUAL RELAY
+// ==========================================
 
-const uint16_t RX_ID = 0x100;
+// ---------- PIN MAP ----------
+const uint8_t CAN_CS_PIN = 10;
+const uint8_t RELAY_LEFT_PIN = 4;
+const uint8_t RELAY_RIGHT_PIN = 5;
+
+// HL-52S LOW TRIGGER 기준
+const uint8_t RELAY_ON = LOW;
+const uint8_t RELAY_OFF = HIGH;
+
+// ---------- CAN ----------
+const uint16_t CMD_ID = 0x100;
 const uint16_t ACK_ID = 0x101;
 
-// 실제 크리스털이 16MHz라면 변경
-const CAN_CLOCK CAN_OSC = MCP_8MHZ;
+// TX와 같은 수정 발진자 설정
+const CAN_CLOCK CAN_XTAL = MCP_8MHZ;
 
-const unsigned long UI_INTERVAL = 180;
-const unsigned long LINK_TIMEOUT = 1200;
-const unsigned long RECOVERY_INTERVAL = 4000;
+MCP2515 can(CAN_CS_PIN);
 
-MCP2515 can(CAN_CS, 8000000);
-
-U8G2_SH1107_SEEED_128X128_1_HW_I2C oled(
+U8G2_SH1107_SEEED_128X128_2_HW_I2C oled(
   U8G2_R0, U8X8_PIN_NONE
 );
 
-// ===== 상태 변수 =====
+// ---------- TIMING ----------
+const unsigned long RX_TIMEOUT = 750;
+const unsigned long OLED_INTERVAL = 250;
+const unsigned long OLED_FAST_INTERVAL = 80;
+
+const unsigned long RECOVERY_DELAY = 4000;
+const unsigned long RETRY_INTERVAL = 4000;
+
+// ---------- RECEIVED DATA ----------
+int receivedADC = 512;
 int receivedPercent = 0;
 
-byte receivedSequence = 0;
-byte lastData[5] = {0};
+bool leftPressed = false;
+bool rightPressed = false;
 
-unsigned long lastRx = 0;
-unsigned long lastUi = 0;
-unsigned long lastRecovery = 0;
-unsigned long lastDiag = 0;
-unsigned long linkStarted = 0;
+bool relayLeft = false;
+bool relayRight = false;
 
 bool canReady = false;
-bool receivedOnce = false;
-bool wasOnline = false;
+bool everReceived = false;
+bool uiDirty = true;
 
-// ===== 방향 표시 =====
-const char* directionText(int value) {
+uint8_t receivedSequence = 0;
 
-  if (value < 0) return "PORT";
-  if (value > 0) return "STARBOARD";
+// ---------- TIMER ----------
+unsigned long lastRX = 0;
+unsigned long lastOLED = 0;
+unsigned long lastRecovery = 0;
 
-  return "NEUTRAL";
-}
+// ---------- COUNTERS ----------
+unsigned long rxOK = 0;
+unsigned long ackOK = 0;
+unsigned long ackFail = 0;
+unsigned long relayChanges = 0;
+unsigned long resetCount = 0;
 
-// ===== XOR 검증값 계산 =====
-byte checksum(const byte* data) {
+// ==========================================
+// CHECKSUM
+// ==========================================
+uint8_t checksum(const uint8_t *data,
+                 uint8_t length) {
+  uint8_t result = 0x5A;
 
-  byte result = 0xA5;
-
-  for (byte i = 0; i < 4; i++) {
+  for (uint8_t i = 0; i < length; i++) {
     result ^= data[i];
   }
 
   return result;
 }
 
-// ===== CAN 초기화 =====
-bool initCAN() {
+// ==========================================
+// LINK STATUS
+// ==========================================
+bool linkOK() {
+  return canReady &&
+         everReceived &&
+         millis() - lastRX <= RX_TIMEOUT;
+}
 
+// ==========================================
+// RELAY CONTROL
+// 상태가 변경될 때만 출력
+// ==========================================
+void setRelay(bool newLeft, bool newRight) {
+
+  // 좌우 동시 ON 금지
+  if (newLeft && newRight) {
+    newLeft = false;
+    newRight = false;
+  }
+
+  if (newLeft == relayLeft &&
+      newRight == relayRight) {
+    return;
+  }
+
+  // 먼저 OFF할 릴레이 처리
+  if (relayLeft && !newLeft) {
+    digitalWrite(RELAY_LEFT_PIN, RELAY_OFF);
+  }
+
+  if (relayRight && !newRight) {
+    digitalWrite(RELAY_RIGHT_PIN, RELAY_OFF);
+  }
+
+  // 그다음 필요한 릴레이만 ON
+  if (newLeft && !relayLeft) {
+    digitalWrite(RELAY_LEFT_PIN, RELAY_ON);
+  }
+
+  if (newRight && !relayRight) {
+    digitalWrite(RELAY_RIGHT_PIN, RELAY_ON);
+  }
+
+  relayLeft = newLeft;
+  relayRight = newRight;
+
+  relayChanges++;
+  uiDirty = true;
+
+  Serial.print(F("RELAY L="));
+  Serial.print(relayLeft ? "ON" : "OFF");
+
+  Serial.print(F(" R="));
+  Serial.println(relayRight ? "ON" : "OFF");
+}
+
+// ==========================================
+// CAN INITIALIZATION
+// ==========================================
+bool initCAN() {
   can.reset();
 
-  MCP2515::ERROR result =
-    can.setBitrate(CAN_500KBPS, CAN_OSC);
-
-  if (result == MCP2515::ERROR_OK) {
-    result = can.setNormalMode();
+  if (can.setBitrate(CAN_500KBPS, CAN_XTAL)
+      != MCP2515::ERROR_OK) {
+    Serial.println(F("RX BITRATE FAIL"));
+    return false;
   }
 
-  canReady = (result == MCP2515::ERROR_OK);
-
-  Serial.print(F("CAN INIT: "));
-  Serial.println(
-    canReady ? F("OK") : F("FAIL")
-  );
-
-  return canReady;
-}
-
-// ===== 통신 상태 확인 =====
-bool linkOnline() {
-
-  return canReady &&
-         receivedOnce &&
-         (millis() - lastRx < LINK_TIMEOUT);
-}
-
-// ===== 상태 문구 =====
-const char* linkText() {
-
-  unsigned long now = millis();
-
-  if (linkOnline()) {
-
-    if (now - linkStarted < 900) {
-      return "RECOVERING";
-    }
-
-    return "LINK OK";
+  if (can.setNormalMode()
+      != MCP2515::ERROR_OK) {
+    Serial.println(F("RX NORMAL FAIL"));
+    return false;
   }
 
-  if (now - lastRecovery < 1200) {
-    return "RECOVERING";
-  }
+  resetCount++;
+  Serial.println(F("RX CAN INITIALIZED"));
 
-  return "DISCONNECTED";
+  return true;
 }
 
-// ===== 정상 CAN 데이터 수신 =====
+// ==========================================
+// SEND ACK
+// ==========================================
+void sendACK(uint8_t seq) {
+  if (!canReady) return;
+
+  struct can_frame frame;
+
+  frame.can_id = ACK_ID;
+  frame.can_dlc = 3;
+
+  frame.data[0] = 0xA5;
+  frame.data[1] = seq;
+  frame.data[2] = checksum(frame.data, 2);
+
+  if (can.sendMessage(&frame)
+      == MCP2515::ERROR_OK) {
+    ackOK++;
+  } else {
+    ackFail++;
+  }
+}
+
+// ==========================================
+// RECEIVE COMMAND
+// ==========================================
 void receiveCAN() {
+  if (!canReady) return;
 
-  struct can_frame frame = {};
+  struct can_frame frame;
 
-  // 한 번에 최대 6개 메시지를 읽는다.
-  for (byte n = 0; n < 6; n++) {
+  // 최대 16개 대기 메시지 처리
+  for (uint8_t i = 0; i < 16; i++) {
 
     if (can.readMessage(&frame)
         != MCP2515::ERROR_OK) {
       break;
     }
 
-    // 표준 CAN 데이터 프레임만 사용
-    if (frame.can_id != RX_ID ||
-        frame.can_dlc != 5) {
+    if (frame.can_id != CMD_ID ||
+        frame.can_dlc != 7) {
       continue;
     }
 
-    // 데이터 검증 실패 시 무시
-    if (checksum(frame.data) != frame.data[4]) {
-      Serial.println(F("CHECKSUM ERROR"));
+    if (frame.data[5] != 1) {
       continue;
     }
 
-    // 두 바이트를 16비트 값으로 복원
-    uint16_t raw =
+    if (frame.data[6] !=
+        checksum(frame.data, 6)) {
+      continue;
+    }
+
+    uint16_t adc =
       (uint16_t)frame.data[1] |
       ((uint16_t)frame.data[2] << 8);
 
-    // 음수까지 복원
-    int32_t value = raw;
+    if (adc > 1023) continue;
 
-    if (raw >= 0x8000) {
-      value -= 65536L;
-    }
+    uint8_t flags = frame.data[3];
 
-    // 조작값 범위 검사
-    if (value < -100 || value > 100) {
-      Serial.println(F("RANGE ERROR"));
+    if (flags & 0xFC) continue;
+
+    int percent = (int8_t)frame.data[4];
+
+    if (percent < -100 || percent > 100) {
       continue;
     }
 
-    // 방향 코드 검사
-    byte expectedDirection = 0;
+    // ---------- VALID FRAME ----------
+    int oldPercent = receivedPercent;
 
-    if (value < 0) expectedDirection = 1;
-    if (value > 0) expectedDirection = 2;
+    bool oldLeft = leftPressed;
+    bool oldRight = rightPressed;
 
-    if (frame.data[3] != expectedDirection) {
-      Serial.println(F("DIRECTION ERROR"));
-      continue;
-    }
+    receivedADC = adc;
+    receivedPercent = percent;
 
-    // 정상 메시지 수신
-    receivedPercent = (int)value;
+    leftPressed = (flags & 0x01) != 0;
+    rightPressed = (flags & 0x02) != 0;
+
     receivedSequence = frame.data[0];
 
-    for (byte i = 0; i < 5; i++) {
-      lastData[i] = frame.data[i];
+    lastRX = millis();
+    everReceived = true;
+    rxOK++;
+
+    // 스위치 신호 즉시 릴레이 적용
+    setRelay(leftPressed, rightPressed);
+
+    // 화면 표시 변경 예약
+    if (oldPercent != receivedPercent ||
+        oldLeft != leftPressed ||
+        oldRight != rightPressed) {
+      uiDirty = true;
     }
 
-    lastRx = millis();
-    receivedOnce = true;
-
-    // ===== 송신측으로 응답 =====
-
-    struct can_frame reply = {};
-
-    reply.can_id = ACK_ID;
-    reply.can_dlc = 5;
-
-    // 수신한 데이터 5바이트를 그대로 반환
-    for (byte i = 0; i < 5; i++) {
-      reply.data[i] = frame.data[i];
-    }
-
-    MCP2515::ERROR result =
-      can.sendMessage(&reply);
-
-    if (result != MCP2515::ERROR_OK) {
-      Serial.print(F("ECHO ERROR: "));
-      Serial.println((int)result);
-    }
+    // 정상 수신 ACK
+    sendACK(receivedSequence);
   }
 }
 
-// ===== 자동 복구 =====
-void checkRecovery() {
+// ==========================================
+// LINK WATCHDOG
+// ==========================================
+void checkConnection() {
+  if (linkOK()) return;
 
+  // 명령을 더 이상 받지 못하면 OFF
+  setRelay(false, false);
+}
+
+// ==========================================
+// AUTOMATIC RECOVERY
+// ==========================================
+void recoverCAN() {
   unsigned long now = millis();
 
-  bool online = linkOnline();
-
-  if (online && !wasOnline) {
-    linkStarted = now;
-    Serial.println(F("LINK RESTORED"));
+  if (now - lastRecovery < RETRY_INTERVAL) {
+    return;
   }
 
-  if (!online && wasOnline) {
-    Serial.println(F("LINK LOST"));
+  bool mustRecover = !canReady;
+
+  if (canReady) {
+    uint8_t eflg = can.getErrorFlags();
+
+    // TX Bus-Off
+    if (eflg & 0x20) {
+      mustRecover = true;
+    }
+
+    // 수신이 장시간 중단된 경우
+    if (now - lastRX > RECOVERY_DELAY) {
+      mustRecover = true;
+    }
   }
 
-  wasOnline = online;
+  if (!mustRecover) return;
 
-  if (online) return;
+  lastRecovery = now;
 
-  // 4초마다 재초기화
-  if (now - lastRecovery >= RECOVERY_INTERVAL) {
+  // 복구 전 출력 OFF
+  setRelay(false, false);
 
-    lastRecovery = now;
+  canReady = false;
+  everReceived = false;
 
-    Serial.println(F("CAN RECOVERY"));
+  Serial.println(F("RX CAN RECOVERING"));
 
-    canReady = initCAN();
-
-    receivedOnce = false;
-  }
+  canReady = initCAN();
+  uiDirty = true;
 }
 
-// ===== HEX 문자열 생성 =====
-void formatHex(char* output, size_t size) {
-
-  snprintf(
-    output, size,
-    "%02X %02X %02X %02X %02X",
-    lastData[0], lastData[1], lastData[2],
-    lastData[3], lastData[4]
-  );
-}
-
-// ===== OLED 표시 =====
+// ==========================================
+// OLED
+// ==========================================
 void drawOLED() {
-
-  char percentStr[12];
-  char infoStr[28];
-  char hexStr[20];
-
-  bool online = linkOnline();
-
-  if (online) {
-    snprintf(
-      percentStr, sizeof(percentStr),
-      "%+d%%", receivedPercent
-    );
-  } else {
-    strcpy(percentStr, "--");
-  }
-
-  formatHex(hexStr, sizeof(hexStr));
+  char s[24];
 
   oled.firstPage();
 
   do {
+    oled.setFont(u8g2_font_6x12_tr);
 
-    oled.setFont(u8g2_font_6x10_tf);
+    oled.drawStr(3, 12, "CAN RX / RELAY");
+    oled.drawHLine(3, 16, 122);
 
-    oled.drawStr(2, 10, "CAN / RX MONITOR");
-    oled.drawHLine(0, 14, 128);
+    oled.setFont(u8g2_font_helvB18_tr);
 
-    // 수신 조작값
-    oled.setFont(u8g2_font_helvB18_tf);
-    oled.drawStr(2, 39, percentStr);
+    snprintf(s, sizeof(s),
+             "%+d%%", receivedPercent);
 
-    oled.setFont(u8g2_font_6x10_tf);
+    oled.drawStr(7, 43, s);
 
-    oled.drawStr(
-      2, 52,
-      online ? directionText(receivedPercent)
-             : "NO SIGNAL"
-    );
+    oled.setFont(u8g2_font_6x12_tr);
 
-    oled.drawStr(2, 67, "ID:0x100  500kbps");
+    if (receivedPercent < 0)
+      oled.drawStr(4, 57, "DIR: PORT");
+    else if (receivedPercent > 0)
+      oled.drawStr(4, 57, "DIR: STARBOARD");
+    else
+      oled.drawStr(4, 57, "DIR: NEUTRAL");
 
-    snprintf(
-      infoStr, sizeof(infoStr),
-      "DLC:5 SEQ:%03u",
-      receivedSequence
-    );
+    snprintf(s, sizeof(s),
+             "LEFT SW : %s",
+             leftPressed ? "ON" : "OFF");
+    oled.drawStr(4, 71, s);
 
-    oled.drawStr(2, 79, infoStr);
+    snprintf(s, sizeof(s),
+             "RIGHT SW: %s",
+             rightPressed ? "ON" : "OFF");
+    oled.drawStr(4, 84, s);
 
-    // 실제 수신한 CAN 데이터 HEX
-    oled.setFont(u8g2_font_5x8_tf);
+    snprintf(s, sizeof(s),
+             "RELAY L:%s R:%s",
+             relayLeft ? "ON" : "OFF",
+             relayRight ? "ON" : "OFF");
+    oled.drawStr(4, 97, s);
 
-    if (online) {
-      oled.drawStr(2, 91, hexStr);
-    } else {
-      oled.drawStr(2, 91, "-- -- -- -- --");
-    }
+    oled.drawHLine(3, 104, 122);
 
-    // 마지막 수신 경과시간
-    oled.setFont(u8g2_font_6x10_tf);
-
-    if (online) {
-
-      snprintf(
-        infoStr, sizeof(infoStr),
-        "AGE:%lu ms",
-        millis() - lastRx
-      );
-
-    } else {
-      strcpy(infoStr, "AGE: --");
-    }
-
-    oled.drawStr(2, 106, infoStr);
-
-    oled.drawHLine(0, 111, 128);
-
-    // 정상 / 단절 / 복구 상태
-    oled.drawStr(2, 124, linkText());
+    if (!canReady)
+      oled.drawStr(4, 117, "CAN INIT FAIL");
+    else if (linkOK())
+      oled.drawStr(4, 117, "LINK OK");
+    else
+      oled.drawStr(4, 117, "DISCONNECTED");
 
   } while (oled.nextPage());
 }
 
-// ===== 최초 한 번 실행 =====
-void setup() {
-
-  Serial.begin(115200);
-
-  pinMode(CAN_CS, OUTPUT);
-  digitalWrite(CAN_CS, HIGH);
-
-  Wire.begin();
-  oled.begin();
-
-  SPI.begin();
-
-  lastRecovery = millis();
-
-  initCAN();
-  drawOLED();
-}
-
-// ===== 계속 반복 =====
-void loop() {
+// ==========================================
+// SERIAL DIAGNOSTICS
+// ==========================================
+void printDiagnostics() {
+  static unsigned long lastPrint = 0;
 
   unsigned long now = millis();
 
-  if (canReady) {
+  if (now - lastPrint < 1000) return;
+  lastPrint = now;
 
-    // CAN 조작값 수신
-    receiveCAN();
-  }
+  Serial.print(F("RX OK="));
+  Serial.print(rxOK);
 
-  // 통신 상태 및 자동 복구
-  checkRecovery();
+  Serial.print(F(" ACK_OK="));
+  Serial.print(ackOK);
 
-  // OLED 갱신
-  if (now - lastUi >= UI_INTERVAL) {
+  Serial.print(F(" ACK_FAIL="));
+  Serial.print(ackFail);
 
-    lastUi = now;
+  Serial.print(F(" RELAY_CHG="));
+  Serial.print(relayChanges);
+
+  Serial.print(F(" RESET="));
+  Serial.print(resetCount);
+
+  Serial.print(F(" LINK="));
+  Serial.print(linkOK() ? "OK" : "LOST");
+
+  Serial.print(F(" EFLG=0x"));
+
+  if (canReady)
+    Serial.print(can.getErrorFlags(), HEX);
+  else
+    Serial.print(F("NA"));
+
+  Serial.println();
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+
+  // 릴레이 초기 상태 OFF
+  digitalWrite(RELAY_LEFT_PIN, RELAY_OFF);
+  digitalWrite(RELAY_RIGHT_PIN, RELAY_OFF);
+
+  pinMode(RELAY_LEFT_PIN, OUTPUT);
+  pinMode(RELAY_RIGHT_PIN, OUTPUT);
+
+  relayLeft = false;
+  relayRight = false;
+
+  Wire.begin();
+
+  oled.begin();
+
+  // OLED I2C 400kHz
+  oled.setBusClock(400000);
+
+  SPI.begin();
+
+  canReady = initCAN();
+
+  lastRecovery = millis();
+
+  Serial.println(F("RX READY"));
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+void loop() {
+  unsigned long now = millis();
+
+  // 1. CAN 명령 수신 최우선
+  receiveCAN();
+
+  // 2. 통신 단절 시 출력 차단
+  checkConnection();
+
+  // 3. 통신 복구
+  recoverCAN();
+
+  // 4. OLED 후순위 갱신
+  now = millis();
+
+  unsigned long drawInterval =
+    uiDirty ? OLED_FAST_INTERVAL :
+              OLED_INTERVAL;
+
+  if (now - lastOLED >= drawInterval) {
+    lastOLED = now;
+    uiDirty = false;
     drawOLED();
   }
 
-  // 2초마다 시리얼 진단 출력
-  if (now - lastDiag >= 2000) {
-
-    lastDiag = now;
-
-    Serial.print(F("SEQ="));
-    Serial.print(receivedSequence);
-
-    Serial.print(F(" TEC="));
-    Serial.print(can.errorCountTX());
-
-    Serial.print(F(" REC="));
-    Serial.println(can.errorCountRX());
-  }
+  // 5. 진단 로그
+  printDiagnostics();
 }
